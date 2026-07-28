@@ -1,3 +1,6 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from scraper import fetch_html
 from parser import parse_html
 
@@ -12,15 +15,142 @@ from logger import (
 
 from text_storage import (
     append_launch,
-    get_text_file
+    get_text_file,
+    launch_exists
 )
 
 from progress import save_progress
 from stations import STATIONS
 
 
+# How many stations to download in parallel per launch.
+# Raise/lower this based on how your network and the
+# server respond -- 8 is a reasonable, polite default.
+MAX_WORKERS = 8
+
+
 # ==========================================================
-# Process One Launch
+# Process One Station (runs inside a worker thread)
+# ==========================================================
+
+def _process_station(station_name, station_number, launch, stats, stats_lock):
+
+    path = get_text_file(station_name)
+
+    # --------------------------------------------------
+    # Skip instantly if already downloaded (no network call)
+    # --------------------------------------------------
+
+    if launch_exists(path, launch):
+
+        return f"{station_name}: Already Downloaded"
+
+    wait_before_request()
+
+    with stats_lock:
+        stats.total_stations += 1
+        stats.total_requests += 1
+
+    # --------------------------------------------------
+    # Download HTML
+    # --------------------------------------------------
+
+    try:
+
+        result = fetch_html(
+            station_number,
+            launch
+        )
+
+    except Exception as error:
+
+        with stats_lock:
+            stats.network_failed += 1
+
+        return f"{station_name}: Request Failed - {error}"
+
+    with stats_lock:
+        stats.retry_attempts += result.get("retries", 0)
+
+    status = result["status"]
+
+    # --------------------------------------------------
+    # No Data
+    # --------------------------------------------------
+
+    if status == "no_data":
+
+        with stats_lock:
+            stats.no_data += 1
+
+        return f"{station_name}: No Data"
+
+    # --------------------------------------------------
+    # Network Error
+    # --------------------------------------------------
+
+    if status in (
+        "network_error",
+        "http_error",
+        "request_error"
+    ):
+
+        with stats_lock:
+            stats.network_failed += 1
+
+        return f"{station_name}: Network Failed"
+
+    # --------------------------------------------------
+    # Parse HTML
+    # --------------------------------------------------
+
+    try:
+
+        data = parse_html(result["html"])
+
+    except Exception as error:
+
+        with stats_lock:
+            stats.parser_failed += 1
+
+        return f"{station_name}: Parser Exception - {error}"
+
+    if data is None:
+
+        with stats_lock:
+            stats.parser_failed += 1
+
+        return f"{station_name}: Parser returned None"
+
+    # --------------------------------------------------
+    # Save TXT
+    # --------------------------------------------------
+
+    try:
+
+        append_launch(
+            station_name=data["station_name"],
+            station_number=data["station_number"],
+            launch_time=data["launch_time"],
+            table_text=data["table_text"]
+        )
+
+    except Exception as error:
+
+        with stats_lock:
+            stats.validation_failed += 1
+
+        return f"{station_name}: Save Failed - {error}"
+
+    with stats_lock:
+        stats.saved_records += 1
+        stats.successful_downloads += 1
+
+    return f"{station_name}: Saved -> {path}"
+
+
+# ==========================================================
+# Process One Launch (all stations in parallel)
 # ==========================================================
 
 def process_launch(
@@ -33,179 +163,44 @@ def process_launch(
 
     log_info(f"Launch: {launch}")
 
-    start_index = 0
-
-    if (
-        resume_data is not None
-        and launch == resume_data["launch"]
-    ):
-        start_index = resume_data["station_index"] + 1
+    stats_lock = threading.Lock()
 
     station_items = list(STATIONS.items())
 
-    for station_index, (station_name, station_number) in enumerate(station_items):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-        if station_index < start_index:
-            continue
-
-        stats.total_stations += 1
-
-        log_info(
-            f"Downloading {station_name}"
-        )
-
-        wait_before_request()
-
-        stats.total_requests += 1
-
-        # --------------------------------------------------
-        # Download HTML
-        # --------------------------------------------------
-
-        try:
-
-            result = fetch_html(
+        futures = {
+            executor.submit(
+                _process_station,
+                station_name,
                 station_number,
-                launch
-            )
+                launch,
+                stats,
+                stats_lock
+            ): station_name
+            for station_name, station_number in station_items
+        }
 
-        except Exception as error:
+        for future in as_completed(futures):
 
-            log_error(
-                f"{station_name}: Request Failed - {error}"
-            )
+            message = future.result()
 
-            stats.network_failed += 1
-            continue
+            if "Saved" in message:
+                log_success(message)
+            elif "Already Downloaded" in message:
+                log_info(message)
+            elif "No Data" in message:
+                log_warning(message)
+            else:
+                log_error(message)
 
-        stats.retry_attempts += result.get(
-            "retries",
-            0
-        )
+    # --------------------------------------------------
+    # Save Resume Progress (whole launch is now complete)
+    # --------------------------------------------------
 
-        status = result["status"]
-
-        # --------------------------------------------------
-        # No Data
-        # --------------------------------------------------
-
-        if status == "no_data":
-
-            log_warning(
-                f"{station_name}: No Data"
-            )
-
-            stats.no_data += 1
-            continue
-
-        # --------------------------------------------------
-        # Network Error
-        # --------------------------------------------------
-
-        if status in (
-            "network_error",
-            "http_error",
-            "request_error"
-        ):
-
-            log_error(
-                f"{station_name}: Network Failed"
-            )
-
-            stats.network_failed += 1
-            continue
-
-        # --------------------------------------------------
-        # Parse HTML
-        # --------------------------------------------------
-
-        try:
-
-            data = parse_html(
-                result["html"]
-            )
-
-        except Exception as error:
-
-            log_error(
-                f"{station_name}: Parser Exception - {error}"
-            )
-
-            stats.parser_failed += 1
-            continue
-
-        if data is None:
-
-            log_error(
-                f"{station_name}: Parser returned None"
-            )
-
-            # Save failed HTML for debugging
-            try:
-
-                with open(
-                    "parser_failed.html",
-                    "w",
-                    encoding="utf-8"
-                ) as file:
-
-                    file.write(result["html"])
-
-                log_warning(
-                    "Failed HTML saved as parser_failed.html"
-                )
-
-            except Exception:
-                pass
-
-            stats.parser_failed += 1
-            continue
-
-        # --------------------------------------------------
-        # Save TXT
-        # --------------------------------------------------
-
-        try:
-
-            append_launch(
-
-                station_name=data["station_name"],
-
-                station_number=data["station_number"],
-
-                launch_time=data["launch_time"],
-
-                table_text=data["table_text"]
-
-            )
-
-        except Exception as error:
-
-            log_error(
-                f"{station_name}: Save Failed - {error}"
-            )
-
-            stats.validation_failed += 1
-            continue
-
-        stats.saved_records += 1
-        stats.successful_downloads += 1
-
-        path = get_text_file(
-            station_name
-        )
-
-        log_success(
-            f"Saved: {path}"
-        )
-
-        # --------------------------------------------------
-        # Save Resume Progress
-        # --------------------------------------------------
-
-        save_progress(
-            start_date,
-            end_date,
-            launch,
-            station_index
-        )
+    save_progress(
+        start_date,
+        end_date,
+        launch,
+        len(station_items) - 1
+    )
