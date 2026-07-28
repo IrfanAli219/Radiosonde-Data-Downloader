@@ -1,5 +1,6 @@
 import time
 import requests
+from requests.adapters import HTTPAdapter
 
 from config import (
     REQUEST_TIMEOUT,
@@ -15,6 +16,16 @@ from config import (
 URL = "https://weather.uwyo.edu/wsgi/sounding"
 
 SESSION = requests.Session()
+
+# Increase connection pool size so multiple threads can reuse
+# this single Session without exhausting/recreating connections.
+_ADAPTER = HTTPAdapter(
+    pool_connections=20,
+    pool_maxsize=20
+)
+
+SESSION.mount("https://", _ADAPTER)
+SESSION.mount("http://", _ADAPTER)
 
 
 # ==========================================================
